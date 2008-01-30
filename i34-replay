@@ -1,0 +1,121 @@
+#!/usr/bin/perl
+# Copyright 2008 Abhijit Menon-Sen <ams@toroid.org>
+#
+
+use LWP::UserAgent;
+use Date::Manip;
+
+unless ( @ARGV == 1 ) {
+    die "Syntax: $0 <directory-name>\n";
+}
+
+$record = shift @ARGV;
+
+unless ( -d $record ) {
+    die "$0: Journal directory $record does not exist.\n";
+}
+
+unless ( -f "$record/journal" ) {
+    die "$0: Directory $record does not contain a journal file.\n";
+}
+
+open( JOURNAL, "$record/journal" ) || die "$record/journal: $!\n";
+
+chomp( $sig = <JOURNAL> );
+unless ( ($from, $to, $in) =
+         ($sig =~ /^# i34-record from (.*?) to (.*?) in (.*?)$/ ) )
+{
+    die "$0: Invalid journal file in $record.\n";
+}
+
+print "Using $from as proxy for $to.\n";
+
+my @connections =
+    map { /^\[(.*?)\] (\d+)$/ && [ UnixDate( $1, "%s" ) => $2 ] }
+        <JOURNAL>;
+
+my %kids = ();
+
+sub REAPER {
+    $pid = wait;
+    delete $kids{$pid};
+    $SIG{CHLD} = \&REAPER;
+}
+$SIG{CHLD} = \&REAPER;
+
+my $start = time;
+foreach ( @connections ) {
+    my ($ts, $connection) = @$_;
+
+    my $delta = $ts-$connections[0][0];
+    if ( $delta != 0 ) {
+        print "Sleeping for $delta seconds.\n";
+        sleep $delta;
+    }
+
+    print "t+${delta}s: Forking to handle connection $connection.\n";
+
+    my $pid = fork;
+    die "Could not fork: $!\n" unless defined $pid;
+
+    if ( $pid == 0 ) {
+        process_connection( $connection );
+        exit 0;
+    }
+    else {
+        $kids{$pid}++;
+    }
+}
+
+while ( keys %kids ) {
+    sleep 1;
+}
+
+my $total=time-$start;
+print "Done (t+${total}s).\n";
+exit;
+
+sub process_connection {
+    my ($connection) = @_;
+
+    open( RECORD, "$record/$connection" ) or
+        die "$connection: Can't open $record/$connection: $!\n";
+
+    my $ua = LWP::UserAgent->new( keep_alive => 1 );
+    $ua->agent( "" );
+    $ua->proxy( ['http'], "http://$from" );
+
+    my $lastts = 0;
+    while ( <RECORD> ) {
+        chomp;
+
+        if ( /^\[(.*?)\] (\d+)$/ ) {
+            my $ts = UnixDate( $1, "%s" );
+            my $reqno = $2;
+
+            my $delta = $ts-$lastts;
+            $delta = 0 if $lastts == 0;
+            if ( $delta != 0 ) {
+                print "$connection: Sleeping for $delta seconds.\n";
+                sleep $delta;
+            }
+            $lastts = $ts;
+
+            my $s;
+            do {
+                chomp( $l = <RECORD> );
+                if ( $l =~ /^C: (.*)$/ ) {
+                    $s .= "$1\n";
+                }
+            }
+            while ( $l !~ /^$/ );
+            my $req = HTTP::Request->parse( $s );
+            print "$connection: t+${delta}s: Dispatching request #$reqno ",
+                "to ", $req->uri->path, "\n";
+            $ua->simple_request( $req );
+        }
+    }
+
+    print "$connection: Done.\n";
+    close RECORD;
+}

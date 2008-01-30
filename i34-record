@@ -1,0 +1,334 @@
+#!/usr/bin/perl -w
+# Copyright 2008 Abhijit Menon-Sen <ams@toroid.org>
+#
+
+use POSIX;
+use Fcntl qw( :flock );
+use HTML::Parser;
+use HTTP::Proxy qw( :log );
+use HTTP::Proxy::HeaderFilter::simple;
+use HTTP::Proxy::BodyFilter::complete;
+use HTTP::Proxy::BodyFilter::htmlparser;
+
+# A typical invocation looks like this:
+#
+# ./i34-record from localhost:8888 to http://foo.example.com in foo
+#
+# This tells the proxy to accept HTTP connections on localhost:8888,
+# forward them to http://foo.example.com, and maintain a journal of
+# requests and responses in a directory named x.
+#
+# The "in foo" clause is optional. If omitted, a directory name is
+# chosen based on the date and a sequence number (e.g. 20080101-1).
+# It is an error to specify the name of an existing directory.
+#
+# The noise-words "from", "to", and "in" are also optional.
+
+sub help {
+    die "Syntax: $0 from <host:port> to <server-url> in <directory>\n";
+}
+
+# Where should we listen for connections?
+# This argument is assumed to be in "localhost:8889" form, but we don't
+# check this here, because HTTP::Proxy will fail when we try to create
+# the proxy with these arguments later.
+
+help() unless @ARGV >= 1;
+shift @ARGV if $ARGV[0] eq "from";
+$from = shift @ARGV || help;
+($fromhost, $fromport) = split /:/, $from, 2;
+
+# Where should we forward those connections to?
+# This is assumed to be a URL, e.g. "http://server.example.org:8080".
+# XXX: This may not be the best idea; nor is the syntax-checking here
+# sufficient.
+
+help() unless @ARGV >= 1;
+shift @ARGV if $ARGV[0] eq "to";
+$to = shift @ARGV || help;
+$server = URI->new( $to );
+
+# Where should we record requests and responses?
+# We need a name for a directory we will create, either from the command
+# line, or based on today's date.
+
+if ( @ARGV ) {
+    shift @ARGV if $ARGV[0] eq "in";
+    $record = shift @ARGV || help;
+}
+else {
+    $i = 1;
+    $date = strftime( "%Y%m%d", localtime );
+    $i++ while -d "$date-$i";
+    $record = "$date-$i";
+}
+
+die "$0: Won't record to existing directory $record.\n" if -d $record;
+
+# Set up the journal, and the means to manage it.
+#
+# The directory we create will contain three kinds of files:
+#
+# 1. A file named journal, which contains one timestamped entry per HTTP
+# connection processed by the proxy.
+#
+# 2. A file named sequence, which contains a 32-bit unsigned integer in
+# network byte order, that represents the tail (i.e. the largest known
+# element) of a monotonically-increasing sequence. Each process claims
+# one number in the sequence.
+#
+# 3. As many numbered files as there are entries in the journal, each
+# containing the requests and responses exchanged over a single HTTP
+# connection, and named by the process's sequence number.
+
+unless ( mkdir $record, 0755 ) {
+    die "$0: Can't create directory $record: $!\n";
+}
+
+open( JOURNAL, ">$record/journal" ) || die "$record/journal: $!\n";
+print JOURNAL "# i34-record from $from to $to in $record\n";
+
+open( SEQUENCE, "+>$record/sequence" ) || die "$record/sequence: $!\n";
+syswrite( SEQUENCE, pack( "N", 0 ) ) || die "$record/sequence: $!\n";
+
+# Set up and start a new proxy.
+
+$proxy =
+    HTTP::Proxy->new( host => $fromhost,
+                      port => $fromport,
+                      via  => "i34-record" );
+
+# We must proxy requests only to our backend server, no matter what the
+# client wants. (XXX: We should disallow CONNECT and anything but POST
+# and GET, but we don't do that yet.)
+#
+# (We act as a transparent proxy, but unfortunately, HTTP::Proxy rejects
+# Host:-less requests before we ever see them, even though we could set
+# the Host ourselves. But that's only a minor problem.)
+
+$proxy->push_filter(
+    request => HTTP::Proxy::HeaderFilter::simple->new(
+        sub {
+            $_[2]->uri->host( $server->host );
+            $_[2]->uri->port( $server->port );
+            $_[1]->header( Host => $server->authority );
+        }
+    ),
+);
+
+# We set up filters to record every request and response, once they are
+# completely received.
+
+$proxy->push_filter(
+    request => RequestBody->new(),
+    response => ResponseHeader->new(),
+    response => HTTP::Proxy::BodyFilter::complete->new,
+    response => ResponseBody->new(),
+);
+
+# And finally, we set up another filter to remove comments from the
+# response body before returning them to the client. (XXX: We should
+# really remove only specially-formatted comments.)
+#
+# (Note that no BodyFilter seems to be applied to text/html response
+# bodies sent with non-200 response codes. See below for more about
+# how responses are actually handled.)
+
+$proxy->push_filter(
+    mime => "text/html",
+    response => HTTP::Proxy::BodyFilter::htmlparser->new(
+        HTML::Parser->new(
+            comment_h => [""],
+            end_document_h => [
+                sub { my $self = shift; $self->{output} = shift; },
+                'self,skipped_text'
+            ]
+        ),
+        rw => 1
+    )
+);
+
+$proxy->logmask( PROXY|STATUS|PROCESS );
+$proxy->log( PROCESS, "i34-record", "from $from to $to in $record" );
+$proxy->start;
+
+package RequestBody;
+
+use base qw( HTTP::Proxy::BodyFilter );
+use HTTP::Proxy qw( :log );
+use Fcntl qw( :flock );
+
+sub begin {
+    my ($self) = @_;
+
+    # We depend on this function being called once before any requests
+    # are processed by a child process. It claims a sequence number for
+    # the connection, makes a journal entry for this process, and opens
+    # a file to record any requests and responses in this connection. It
+    # then stashes all that away for use by this connection's filters.
+
+    if ( not defined $self->proxy->stash( "connection" ) ) {
+        my $now = POSIX::strftime( "%Y%m%dT%H%M%S", localtime );
+
+        local *SEQUENCE = *main::SEQUENCE;
+        local *JOURNAL = *main::JOURNAL;
+
+        # Lock, read, and update the sequence.
+        #
+        # The number we read becomes our connection number, and it is
+        # used to write a journal entry for this connection while we
+        # still hold the sequence lock.
+
+        flock( SEQUENCE, LOCK_EX ) or
+            die "Can't lock sequence: $!\n";
+
+        my $seq;
+        seek( SEQUENCE, 0, 0 );
+        sysread( SEQUENCE, $seq, 4 ) or
+            die "Can't read sequence: $!\n";
+
+        $seq = 1+unpack( "N", $seq );
+        seek( SEQUENCE, 0, 0 );
+        syswrite( SEQUENCE, pack( "N", $seq ) ) or
+            die "Can't update sequence: $!\n";
+
+        print JOURNAL "[$now] $seq\n";
+        close SEQUENCE;
+        close JOURNAL;
+
+        # The sequence number is the name of the record file that will
+        # be used to log requests and responses in this connection.
+
+        open( RECORD, "+>", "${main::record}/$seq" ) or
+            die "Can't open record $seq: $!\n";
+        select( ( select(RECORD), $|=1 )[0] );
+
+        # Initialise the stash for this process so that later filters
+        # have access to the RECORD file handle and other useful data.
+
+        $self->proxy->log( PROCESS, "PROCESS", "Claimed connection #$seq" );
+        $self->proxy->stash( connection => $seq );
+        $self->proxy->stash( RECORD => \*RECORD );
+        $self->proxy->stash( reqnum => 0 );
+    }
+
+    # This function is called every time we have a new request; so we
+    # give each request a number, purely for convenience.
+
+    $self->proxy->stash(
+        reqnum => 1+$self->proxy->stash( "reqnum" )
+    );
+}
+
+# As far as I can tell, a BodyFilter registered in this request chain
+# has access to the whole of the client's request, and will be invoked
+# only once. We depend upon this; and write the beginning of a complete
+# request/response cycle to the record file opened above. Filters on the
+# response chain fill in the rest later.
+#
+# (XXX: This obviously doesn't play nicely with pipelining.)
+
+sub filter {
+    my ($self, $dataref, $request, $protocol, $buffer) = @_;
+
+    my $now = POSIX::strftime( "%Y%m%dT%H%M%S", localtime );
+    local *RECORD = $self->proxy->stash( "RECORD" );
+    my $reqnum = $self->proxy->stash( "reqnum" );
+
+    print RECORD "[$now] $reqnum\n";
+    print RECORD
+        "C: ",
+        $request->method, " ", $request->uri->as_string, " ",
+        $request->protocol, "\n";
+    print RECORD
+        map { "C: $_\n" }
+            main::headers( $request );
+    if ( length $request->content ) {
+        print RECORD
+            map { "C: $_\n" }
+                ( "", split /\n/, $request->content );
+    }
+    print RECORD "\n";
+}
+
+# Response handling is complicated by HTTP::Proxy's somewhat eccentric
+# callback behaviour. In theory, we should have access to the response
+# body at the end() of our BodyFilter. In practice, however, we still
+# need to create a HeaderFilter to deal with non-200 responses, even
+# when they have response bodies.
+#
+# So we install both a HeaderFilter and a BodyFilter, and hope that the
+# response body is completely handled by one or the other. This seems to
+# work, but makes it more difficult to put newlines in the right place.
+
+package ResponseHeader;
+
+use base qw( HTTP::Proxy::HeaderFilter );
+
+sub filter {
+    my ($self, $headers, $response) = @_;
+
+    local *RECORD = $self->proxy->stash( "RECORD" );
+    print RECORD
+        "S: ", $response->protocol, " ", $response->status_line, "\n";
+    print RECORD
+        map { "S: $_\n" }
+            main::headers( $response );
+    if ( length $response->content ) {
+        print RECORD
+            map { "S: $_\n" }
+                ( "", split /\n/, $response->content );
+        print RECORD "\n";
+    }
+    else {
+        print RECORD "S: \n";
+    }
+}
+
+package ResponseBody;
+
+use base qw( HTTP::Proxy::BodyFilter );
+
+sub filter {
+    my ($self, $dataref, $response, $protocol, $buffer) = @_;
+
+    # There's an HTTP::Proxy::BodyFilter::complete on the stack before
+    # us, but we might still get called multiple times while the body
+    # of the response is being assembled.
+    return unless $$dataref;
+
+    local *RECORD = $self->proxy->stash( "RECORD" );
+    print RECORD
+        join "S: ",
+            ( "", map { "$_\n" } split( /\n/, $$dataref ) );
+    print RECORD "\n";
+}
+
+package main;
+
+sub headers {
+    my ($r) = @_;
+
+    my @headers;
+    $r->headers->scan(sub {
+        my ($field, $value) = @_;
+
+        $field =~ s/^://;
+        if ( $value =~ /\n/ ) {
+            $value =~ s/\s+$//;
+            $value =~ s/\n\n+/\n/g;
+            $value =~ s/\n([^\040\t])/\n $1/g;
+        }
+
+        my @values = split /\n/, $value;
+        if ( $field ne "Via" &&
+             $field ne "X-Forwarded-For" )
+        {
+            my $value = shift @values;
+            push @headers, "$field: $value";
+            push @headers, @values;
+        }
+    });
+
+    return @headers;
+}
