@@ -109,6 +109,7 @@ sub process_connection {
                 }
             }
             while ( $l !~ /^$/ );
+            chomp $s;
             my $req = HTTP::Request->parse( $s );
             print "$connection: t+${delta}s: Dispatching request #$reqno ",
                 "to ", $req->uri->path, "\n";

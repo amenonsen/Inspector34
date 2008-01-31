@@ -244,9 +244,13 @@ sub filter {
         map { "C: $_\n" }
             main::headers( $request );
     if ( length $request->content ) {
+        my @lines = split /\n/, $request->content;
+        unshift @lines, "";
+        if ( $lines[-1] =~ /\n$/ ) {
+            push @lines, "";
+        }
         print RECORD
-            map { "C: $_\n" }
-                ( "", split /\n/, $request->content );
+            map { "C: $_\n" } @lines;
     }
     print RECORD "\n";
 }
