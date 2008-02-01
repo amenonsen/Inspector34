@@ -111,7 +111,7 @@ $proxy->push_filter(
         sub {
             $_[2]->uri->host( $server->host );
             $_[2]->uri->port( $server->port );
-            $_[1]->header( Host => $server->authority );
+            $_[1]->header( Host => "$fromhost:$fromport" );
         }
     ),
 );
