@@ -1,0 +1,16 @@
+Inspector34
+-----------
+
+Inspector34 is a transparent web proxy that can replay requests exactly.
+
+...
+
+Inspector34 is distributed under a BSD-style open source license.
+(See the included LICENSE file for details.)
+
+The development of Inspector34 was sponsored by The Daily Source,
+<http://www.thedailysource.org>
+
+--
+Copyright 2007 Abhijit Menon-Sen <ams@toroid.org>
+http://toroid.org/inspector34
