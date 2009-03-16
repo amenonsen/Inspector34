@@ -30,6 +30,8 @@ unless ( ($from, $to, $in) =
 
 print "Using $from as proxy for $to.\n";
 
+($fromhost,$fromport) = split /:/, $from, 2;
+
 my @connections =
     map { /^\[(.*?)\] (\d+)$/ && [ UnixDate( $1, "%s" ) => $2 ] }
         <JOURNAL>;
@@ -83,13 +85,12 @@ sub process_connection {
 
     my $ua = LWP::UserAgent->new( keep_alive => 1 );
     $ua->agent( "" );
-    $ua->proxy( ['http'], "http://$from" );
 
     my $lastts = 0;
     while ( <RECORD> ) {
         chomp;
 
-        if ( /^\[(.*?)\] (\d+)$/ ) {
+        if ( /^\[(.*?)\] Request #(\d+)$/ ) {
             my $ts = UnixDate( $1, "%s" );
             my $reqno = $2;
 
@@ -107,10 +108,20 @@ sub process_connection {
                 if ( $l =~ /^C: (.*)$/ ) {
                     $s .= "$1\n";
                 }
+                elsif ( $l =~ /^F: \[(.*)\]$/ ) {
+                    local *F;
+                    local $/ = undef;
+                    open( F, $1 ) || die "Can't open entity body $1: $!\n";
+                    $s .= <F>;
+                    close F;
+                }
             }
             while ( $l !~ /^$/ );
             chomp $s;
             my $req = HTTP::Request->parse( $s );
+            $req->uri->scheme("http");
+            $req->uri->host($fromhost);
+            $req->uri->port($fromport);
             print "$connection: t+${delta}s: Dispatching request #$reqno ",
                 "to ", $req->uri->path, "\n";
             $ua->simple_request( $req );
