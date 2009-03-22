@@ -111,6 +111,8 @@ POE::Component::Server::TCP->new(
             $heap->{record} = \*RECORD;
             $heap->{connection} = $seq;
 
+            print "Client $seq connected.\n";
+
             spawn_ua();
         },
 
@@ -130,6 +132,10 @@ POE::Component::Server::TCP->new(
             $_[KERNEL]->post(
                 $heap->{proxy_ua} => send_request => $r
             );
+
+            print "Client ", $heap->{connection},
+                  ", request ", $heap->{requests}, ": ",
+                  $r->method, " ", $r->uri->as_string, "\n";
         },
 
     ClientError => \&client_closed,
@@ -143,6 +149,11 @@ POE::Component::Server::TCP->new(
                 $heap->{responses}++;
                 write_message( @$heap{record, connection, responses}, $r );
                 $heap->{client}->put( $r );
+
+                my $ct = $r->content_type;
+                print "Client ", $heap->{connection},
+                      ", response ", $heap->{responses}, ": ",
+                      $r->status_line, ( $ct ? " ($ct)" : "" ), "\n";
             },
 
         _child =>
@@ -210,7 +221,10 @@ sub spawn_ua {
 }
 
 sub client_closed {
-    $_[KERNEL]->post( $_[HEAP]->{proxy_ua} => "shutdown" );
+    my $heap = $_[HEAP];
+
+    $_[KERNEL]->post( $heap->{proxy_ua} => "shutdown" );
+    print "Client ", $heap->{connection}, " disconnected.\n";
 }
 
 sub server_closed {
