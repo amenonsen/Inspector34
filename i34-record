@@ -50,16 +50,16 @@ $toport ||= 80;
 
 if ( @ARGV ) {
     shift @ARGV if $ARGV[0] eq "in";
-    $record = shift @ARGV || help;
+    $recorddir = shift @ARGV || help;
 }
 else {
     $i = 1;
     $date = strftime( "%Y%m%d", localtime );
     $i++ while -d "$date-$i";
-    $record = "$date-$i";
+    $recorddir = "$date-$i";
 }
 
-die "$0: Won't record to existing directory $record.\n" if -d $record;
+die "$0: Won't record to existing directory $recorddir.\n" if -d $recorddir;
 
 # Set up the journal, and the means to manage it.
 #
@@ -74,14 +74,14 @@ die "$0: Won't record to existing directory $record.\n" if -d $record;
 
 $connections = 0;
 
-unless ( mkdir $record, 0755 ) {
-    die "$0: Can't create directory $record: $!\n";
+unless ( mkdir $recorddir, 0755 ) {
+    die "$0: Can't create directory $recorddir: $!\n";
 }
 
-open( JOURNAL, ">", "$record/journal" ) || die "$record/journal: $!\n";
+open( JOURNAL, ">", "$recorddir/journal" ) || die "$recorddir/journal: $!\n";
 select( (select(JOURNAL), $|=1)[0] );
 
-print JOURNAL "# i34-record from $from to $to in $record\n";
+print JOURNAL "# i34-record from $from to $to in $recorddir\n";
 
 # We create a TCP server to accept requests and spawn a TCP client that
 # connects to the origin web server, then relay requests and responses
@@ -104,8 +104,8 @@ POE::Component::Server::TCP->new(
             my $seq = ++$connections;
 
             print main::JOURNAL "[$now] $seq\n";
-            open( RECORD, "+>", "$record/$seq" ) or
-                die "Can't open record $seq: $!\n";
+            open( RECORD, "+>", "$recorddir/$seq" ) or
+                die "Can't open $recorddir/$seq: $!\n";
             select( ( select(RECORD), $|=1 )[0] );
 
             $heap->{record} = \*RECORD;
@@ -257,7 +257,8 @@ sub write_message
         }
         else {
             $filename = $connection .".". $prefix .".". $num;
-            open( F, "+>", "$record/$filename" ) || die "$filename: $!\n";
+            open( F, ">", "$recorddir/$filename" ) or
+                die "$recorddir/filename: $!\n";
             syswrite( F, $m->content );
             close( F );
         }
