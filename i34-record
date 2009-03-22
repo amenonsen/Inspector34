@@ -314,3 +314,69 @@ sub header_lines {
 
     return @headers;
 }
+
+=pod
+
+=head1 NAME
+
+i34-record - A transparent web proxy that records requests and responses.
+
+=head1 SYNOPSIS
+
+i34-record from 127.0.0.1:8889 to www.example.org:80 in a
+
+=head1 DESCRIPTION
+
+The command shown above will start i34-record, which will accept HTTP
+requests on C<127.0.0.1:8889> and relay them to the origin server at
+C<www.example.org:80> and store a complete session transcript in the
+directory named F<a>.
+
+Later, C<i34-record> can be restarted (with a different log directory)
+and C<i34-replay> can use the transcript in F<a> to recreate requests
+and resend them through the proxy server. Then the two transcripts can
+be compared using C<i34-diff>.
+
+The local and remote servers must be specified in "host:port" format
+(both hostnames and IP addresses are fine). The default port for the
+origin server is 80. There is no default for the local server.
+
+The directory name is optional. If not specified, one will be generated
+based on the date and a sequence number. (That is, if it is 2009-03-20
+and a directory named 20090320-1 exists, then 20090320-2 will be used.)
+It is an error to specify a directory that already exists; this is to
+make it harder to inadvertently overwrite old session transcripts.
+
+The words "from", "to", and "in" are also optional.
+
+The transcript directory contains a file named F<journal> which lists
+all the client connections and, for each connection, a numbered file
+that stores the requests and responses sent and received over that
+connection. Non-text message bodies are stored separately in files
+of their own.
+
+These transcripts are in a human-readable format, where lines from the
+client are prefixed with "C: ", and lines from the server with "S: ".
+
+See L<http://toroid.org/inspector34> for more.
+
+=head1 AUTHOR
+
+Abhijit Menon-Sen <ams@toroid.org>
+
+=head1 COPYRIGHT
+
+Copyright 2009 Abhijit Menon-Sen <ams@toroid.org>
+
+This program may be used, modified, or redistributed freely, provided
+that modified versions are clearly identified as being different from
+the original, and that copyright notices and acknowledgements are not
+removed from the code or the accompanying documentation.
+
+This program is provided without any warranty, express or implied. In
+no event shall the author or contributors to this program be liable
+for any damages arising from its use.
+
+=head1 SEE ALSO
+
+i34-replay, i34-diff
