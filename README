@@ -1,9 +1,18 @@
 Inspector34
 -----------
 
-Inspector34 is a transparent web proxy that can replay requests exactly.
+Inspector34 is a transparent web proxy that records requests and
+responses for later playback and comparison. It is meant to help
+with regression testing.
 
-...
+It consists of three programs: i34-record is the proxy server, which
+keeps a journal of HTTP requests and responses; and i34-replay recreates
+the original requests from this journal. i34-diff compares the responses
+from the original and replayed sessions.
+
+Inspector34 is written in Perl, and depends on Rocco Caputo's excellent
+POE framework, as well as the HTTP::Parser and POE::Filter::HTTP::Parser
+modules. These are all available from the CPAN.
 
 Inspector34 is distributed under a BSD-style open source license.
 (See the included LICENSE file for details.)
@@ -11,6 +20,8 @@ Inspector34 is distributed under a BSD-style open source license.
 The development of Inspector34 was sponsored by The Daily Source,
 <http://www.thedailysource.org>
 
+Feedback is welcome.
+
 --
-Copyright 2007 Abhijit Menon-Sen <ams@toroid.org>
+Copyright 2009 Abhijit Menon-Sen <ams@toroid.org>
 http://toroid.org/inspector34

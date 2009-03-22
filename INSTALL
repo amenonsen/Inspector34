@@ -1,0 +1,28 @@
+Installation
+------------
+
+You need the following Perl modules:
+
+  - POE (1.003 or later is known to work).
+
+  - HTTP::Parser 0.04.
+
+    At the time of writing, HTTP::Parser requires a small patch in order
+    to work correctly. The patch is included here (proto.diff). To build
+    the patched module, do the following:
+
+    $ tar xf HTTP-Parser-0.04.tar.gz
+    $ cd HTTP-Parser-0.04
+    $ patch -p1 < ~/proto.diff
+
+    Then "perl Makefile.PL" and "make install" as usual.
+
+  - POE::Filter::HTTP::Parser (0.08 is known to work).
+
+  - Date::Manip (5.54 is known to work).
+
+These modules are all available from the CPAN. See
+<http://search.cpan.org>
+
+Just copy i34-record, i34-replay, and i34-diff somewhere into your path.
+Nothing further is needed for installation.
