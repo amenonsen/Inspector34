@@ -81,6 +81,7 @@ unless ( mkdir $recorddir, 0755 ) {
 open( JOURNAL, ">", "$recorddir/journal" ) || die "$recorddir/journal: $!\n";
 select( (select(JOURNAL), $|=1)[0] );
 
+print "# i34-record from $from to $to in $recorddir\n";
 print JOURNAL "# i34-record from $from to $to in $recorddir\n";
 
 # We create a TCP server to accept requests and spawn a TCP client that
