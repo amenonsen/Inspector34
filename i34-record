@@ -3,6 +3,7 @@
 #
 
 use POSIX;
+use LWP v5.825;
 use Fcntl qw( :flock );
 use POE qw( Filter::HTTP::Parser
             Component::Server::TCP
@@ -14,7 +15,7 @@ use POE qw( Filter::HTTP::Parser
 #
 # This tells the proxy to accept HTTP connections on localhost:8888,
 # forward them to foo.example.com, and maintain a journal of requests
-# and responses in a directory named x.
+# and responses in a directory named foo.
 #
 # The "in foo" clause is optional. If omitted, a directory name is
 # chosen based on the date and a sequence number (e.g. 20080101-1).
@@ -129,7 +130,7 @@ POE::Component::Server::TCP->new(
             $r->header( Host => "$fromhost:$fromport" );
 
             $heap->{requests}++;
-            write_message( @$heap{record, connection, requests}, $r );
+            write_message( @$heap{qw/record connection requests/}, $r );
             $_[KERNEL]->post(
                 $heap->{proxy_ua} => send_request => $r
             );
@@ -148,7 +149,7 @@ POE::Component::Server::TCP->new(
                 my ( $heap, $r ) = @_[ HEAP, ARG0 ];
 
                 $heap->{responses}++;
-                write_message( @$heap{record, connection, responses}, $r );
+                write_message( @$heap{qw/record connection responses/}, $r );
                 $heap->{client}->put( $r );
 
                 my $ct = $r->content_type;

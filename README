@@ -12,7 +12,8 @@ from the original and replayed sessions.
 
 Inspector34 is written in Perl, and depends on Rocco Caputo's excellent
 POE framework, as well as the HTTP::Parser and POE::Filter::HTTP::Parser
-modules. These are all available from the CPAN.
+modules. A recent version of LWP (>=5.825) is also required. These are
+all available from the CPAN.
 
 Inspector34 is distributed under a BSD-style open source license.
 (See the included LICENSE file for details.)
