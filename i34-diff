@@ -1,0 +1,196 @@
+#!/usr/bin/perl
+# Copyright 2009 Abhijit Menon-Sen <ams@toroid.org>
+#
+
+use Date::Manip;
+use File::Temp qw/ tempfile /;
+
+if ( @ARGV != 2 ) {
+    die "Syntax: $0 <original-dir> <replayed-dir>\n";
+}
+
+# Read and compare the description of both journals.
+
+my $original = shift @ARGV;
+open( OJOURNAL, "$original/journal" ) || die "$original/journal: $!\n";
+chomp( my $odesc = <OJOURNAL> );
+chomp( my @ojournal = <OJOURNAL> );
+die "$original is not an i34-record transcript.\n"
+    unless $odesc =~ /# i34-record from .+? to (.+?) in .+?$/;
+
+my $oto = $1;
+
+my $replayed = shift @ARGV;
+open( RJOURNAL, "$replayed/journal" ) || die "$replayed/journal: $!\n";
+chomp( my $rdesc = <RJOURNAL> );
+chomp( my @rjournal = <RJOURNAL> );
+die "$replayed is not an i34-record transcript.\n"
+    unless $rdesc =~ /# i34-record from .+? to (.+?) in .+?$/;
+
+my $rto = $1;
+
+# Both of the following conditions may be true for a properly replayed
+# transcript (particularly the number of connections, which could not
+# be the same if the keep-alives didn't work in exactly the same way).
+# But there's nothing very sensible we can do in that case, so we treat
+# these as errors, at least for now.
+
+die "ERROR: $original and $replayed record sessions to different servers.\n"
+    unless $oto eq $rto;
+
+die "ERROR: $original records ", scalar @ojournal, " sessions, but ",
+    "$replayed records ", scalar @rjournal, " sessions.\n"
+    unless @ojournal == @rjournal;
+
+# Verify the contents of the journals, compare the connections listed
+# therein, then compare the session transcripts.
+
+my $i = 1;
+my $olast = undef;
+my $rlast = undef;
+
+while ( $i <= @ojournal ) {
+    (my $otime, $on) = ( $ojournal[$i-1] =~ /^\[(\d+T\d+)] (\d+)$/ );
+    (my $rtime, $rn) = ( $rjournal[$i-1] =~ /^\[(\d+T\d+)] (\d+)$/ );
+
+    my $outime = UnixDate( $otime, "%s" );
+    my $rutime = UnixDate( $rtime, "%s" );
+
+    if ( $on != $rn || $on != $i ) {
+        # This is not something we really care about, but it is clearly
+        # an insane situation nevertheless, so we bail out early rather
+        # than waiting around for more insanity.
+        die "ERROR: Connections $on and $rn should both be numbered $i.\n";
+    }
+
+    unless ( -f "$original/$on" ) {
+        die "ERROR: $original/journal refers to file $on: $!\n";
+    }
+    unless ( -f "$replayed/$rn" ) {
+        die "ERROR: $replayed/journal refers to file $rn: $!\n";
+    }
+
+    if ( $rutime <= $outime ) {
+        # Is it worth trying to cope with the user plugging arguments
+        # in backwards?
+        die "ERROR: Connection $i was replayed earlier than original!\n";
+    }
+
+    if ( defined $olast && defined $rlast ) {
+        my $origdiff = $rlast - $olast;
+        my $repldiff = $rutime - $outime;
+
+        if ( $origdiff != $repldiff ) {
+            my $err = $repldiff - $origdiff;
+
+            warn "WARNING: Connection $i was established ", abs($err),
+                 " ", "second", ( $err == 1 ? "" : "s" ),
+                 " ", ( $err > 0 ? "late" : "early" ),
+                 " ", "during replay.\n";
+        }
+    }
+    ( $olast, $rlast ) = ( $outime, $rutime );
+
+    # Now we can process each request and response in the session
+    # transcripts: put them in the right order, ignore the minor
+    # differences, and display any major ones.
+
+    my %o = parse_transcript( "$original/$on" );
+    my %r = parse_transcript( "$replayed/$rn" );
+
+    # A little extra sanity-checking. The two transcripts may differ in
+    # the number of requests and responses because of keep-alive changes
+    # (which we don't try to handle), but it should always be possible
+    # to match requests with responses.
+
+    if ( keys %o != keys %r ) {
+        die "ERROR: $original/$on and $replayed/$rn have a different ",
+            "number of request/response pairs.\n";
+    }
+    elsif ( join( ":", sort keys %o ) ne join ( ":", sort keys %r ) ) {
+        die "ERROR: $original/$on and $replayed/$rn have different ",
+            "request/response pairs.\n";
+    }
+
+    foreach (keys %o) {
+        if ( !( defined $o{$_}{request} && defined $o{$_}{response} ) ) {
+            die "ERROR: Couldn't match original request/response pair #$_.\n";
+        }
+    }
+    foreach (keys %r) {
+        if ( !( defined $r{$_}{request} && defined $r{$_}{response} ) ) {
+            die "ERROR: Couldn't match replayed request/response pair #$_.\n";
+        }
+    }
+
+    foreach my $n (keys %o) {
+        my $o = $o{$n};
+        my $r = $r{$n};
+
+        if ( $o->{request} ne $r->{request} ||
+             $o->{response} ne $r->{response} )
+        {
+            my $diff =
+                diff( $o->{request} . "\n" . $o->{response},
+                      $r->{request} . "\n" . $r->{response} );
+            $diff =~ s#^--- .*$#--- original/$i.$n#gm;
+            $diff =~ s#^\+\+\+ .*$#+++ replayed/$i.$n#gm;
+            print $diff;
+        }
+    }
+
+    $i++;
+}
+
+
+sub parse_transcript {
+    my ( $file ) = @_;
+    my %h = ();
+
+    open( my $fh, $file ) or
+        die "ERROR: Can't open $file: $!\n";
+
+    # Read any number of empty-line-delimited messages from the
+    # transcript, and store them in %h indexed by the request or
+    # response number.
+
+    local $/ = "\n\n";
+    while ( <$fh> ) {
+        chomp;
+        my ( $id, @message ) = split /\n/;
+        unless ( $id =~ /^\[.+\] (Request|Response) #(\d+)$/ ) {
+            die "ERROR: Invalid message description: '$id'\n";
+        }
+        my $t = lc $1;
+        my $i = $2;
+
+        foreach ( @message ) {
+            if ( /^.: (Date): /i ) {
+                s/($1):.*$/$1: <<...>>/;
+            }
+            elsif ( /^[CS]: (?:Keep-Alive|Connection): /i ) {
+                # XXX: This is needed only because LWP insists on adding
+                # these headers to the request.
+                next;
+            }
+
+            $h{$i}{$t} .= $_ . "\n";
+        }
+    }
+
+    return %h;
+}
+
+sub diff {
+    my ( $a, $b ) = @_;
+
+    my ( $af, $afname ) = tempfile();
+    print $af $a;
+    close $af;
+
+    my ( $bf, $bfname ) = tempfile();
+    print $bf $b;
+    close $bf;
+
+    return qx( diff -u $afname $bfname );
+}
