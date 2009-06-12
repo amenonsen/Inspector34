@@ -11,7 +11,7 @@ use POE qw( Filter::HTTP::Parser
 
 # A typical invocation looks like this:
 #
-# ./i34-record from localhost:8888 to foo.example.com:80 in foo
+# ./i34-record [-t] from localhost:8888 to foo.example.com:80 in foo
 #
 # This tells the proxy to accept HTTP connections on localhost:8888,
 # forward them to foo.example.com, and maintain a journal of requests
@@ -21,6 +21,11 @@ use POE qw( Filter::HTTP::Parser
 # chosen based on the date and a sequence number (e.g. 20080101-1).
 # It is an error to specify the name of an existing directory (thus
 # existing transcripts will never be overwritten).
+#
+# If specified, -t(ransparent) makes i34-record forward the same Host:
+# value that the client sends it (which is unlikely to please a server
+# that isn't expecting to be transparently proxied). The default is to
+# use the server's own hostname:port.
 #
 # The noise-words "from", "to", and "in" are also optional.
 
@@ -32,6 +37,13 @@ sub help {
 # This argument is assumed to be in "localhost:8889" form.
 
 help() unless @ARGV >= 1;
+
+$transparent = 0;
+if ( $ARGV[0] eq "-t" ) {
+    $transparent = 1;
+    shift @ARGV;
+}
+
 shift @ARGV if $ARGV[0] eq "from";
 $from = shift @ARGV || help;
 ($fromhost, $fromport) = split /:/, $from, 2;
@@ -127,7 +139,10 @@ POE::Component::Server::TCP->new(
 
             $r->remove_header( 'TE' );
             $r->header( Accept_Encoding => "" );
-            $r->header( Host => "$fromhost:$fromport" );
+            $r->header(
+                Host => $transparent ?
+                    "$fromhost:$fromport" : "$tohost:$toport"
+            );
 
             $heap->{requests}++;
             write_message( @$heap{qw/record connection requests/}, $r );
