@@ -4,14 +4,29 @@
 
 use POSIX;
 use LWP v5.825;
+use Data::Dumper;
 use Fcntl qw( :flock );
-use POE qw( Filter::HTTP::Parser
-            Component::Server::TCP
+use POE qw( Component::Server::TCP
             Component::Client::TCP );
+
+
+{
+    package HTTP::MessageParser;
+
+    our $CRLF =
+        '\x0D?\x0A';
+    our $LWS =
+        qr/(?:(?:$CRLF)?[ \t]+)*/;
+    our $TOKEN =
+        qr/[\x21\x23-\x27\x2a\x2b\x2d\x2e\x30-\x39\x41-\x5a\x5e-\x7a\x7c\x7e]+/;
+    our $VERSION =
+        qr/HTTP[ \t]*\/[ \t]*\d+[ \t]*\.[ \t]*\d+/i;
+}
+
 
 # A typical invocation looks like this:
 #
-# ./i34-record [-t] from localhost:8888 to foo.example.com:80 in foo
+# ./i34-record [-t|-v] from localhost:8888 to foo.example.com:80 in foo
 #
 # This tells the proxy to accept HTTP connections on localhost:8888,
 # forward them to foo.example.com, and maintain a journal of requests
@@ -27,6 +42,8 @@ use POE qw( Filter::HTTP::Parser
 # that isn't expecting to be transparently proxied). The default is to
 # use the server's own hostname:port.
 #
+# If specified, -v enables more verbose debug output.
+#
 # The noise-words "from", "to", and "in" are also optional.
 
 sub help {
@@ -38,9 +55,15 @@ sub help {
 
 help() unless @ARGV >= 1;
 
+$verbose = 0;
 $transparent = 0;
-if ( $ARGV[0] eq "-t" ) {
-    $transparent = 1;
+while ( $ARGV[0] =~ /^-/ ) {
+    if ( $ARGV[0] eq "-t" ) {
+        $transparent = 1;
+    }
+    elsif ( $ARGV[0] eq "-v" ) {
+        $verbose++;
+    }
     shift @ARGV;
 }
 
@@ -105,7 +128,7 @@ POE::Component::Server::TCP->new(
     Hostname => $fromhost,
     Port => $fromport,
 
-    ClientFilter => POE::Filter::HTTP::Parser->new( type => 'server' ),
+    ClientFilter => Filter::HTTP->new( 0, $verbose ),
 
     ClientConnected =>
         sub {
@@ -125,18 +148,24 @@ POE::Component::Server::TCP->new(
             $heap->{record} = \*RECORD;
             $heap->{connection} = $seq;
 
-            print "Client $seq connected.\n";
+            print "[$seq] connected\n";
 
             spawn_ua();
         },
 
     ClientInput =>
         sub {
-            my ( $heap, $r ) = @_[ HEAP, ARG0 ];
+            my ( $heap, $m ) = @_[ HEAP, ARG0 ];
+
+            unless ( defined $m ) {
+                $_[KERNEL]->yield( "shutdown" );
+                return;
+            }
 
             # Tell the origin server to send us as plain a response as
             # it can (no compression etc.).
 
+            my $r = $m->{object};
             $r->remove_header( 'TE' );
             $r->header( Accept_Encoding => "" );
             $r->header(
@@ -150,26 +179,27 @@ POE::Component::Server::TCP->new(
                 $heap->{proxy_ua} => send_request => $r
             );
 
-            print "Client ", $heap->{connection},
-                  ", request ", $heap->{requests}, ": ",
+            print "[", $heap->{connection}, "] ",
+                  "request ", $heap->{requests}, ": ",
                   $r->method, " ", $r->uri->as_string, "\n";
         },
 
-    ClientError => \&client_closed,
+    ClientError => sub {},
     ClientDisconnected => \&client_closed,
 
     InlineStates => {
         send_response =>
             sub {
-                my ( $heap, $r ) = @_[ HEAP, ARG0 ];
+                my ( $heap, $m ) = @_[ HEAP, ARG0 ];
 
+                my $r = $m->{object};
                 $heap->{responses}++;
                 write_message( @$heap{qw/record connection responses/}, $r );
-                $heap->{client}->put( $r );
+                $heap->{client}->put( $m->{text} );
 
                 my $ct = $r->content_type;
-                print "Client ", $heap->{connection},
-                      ", response ", $heap->{responses}, ": ",
+                print "[", $heap->{connection}, "] ",
+                      "response ", $heap->{responses}, ": ",
                       $r->status_line, ( $ct ? " ($ct)" : "" ), "\n";
             },
 
@@ -192,7 +222,7 @@ sub spawn_ua {
                 $_[HEAP]->{proxy_server} = $_[SENDER]->ID;
             },
 
-        Filter => POE::Filter::HTTP::Parser->new( type => 'client' ),
+        Filter => Filter::HTTP->new( 1, $verbose ),
 
         Connected =>
             sub {
@@ -208,14 +238,20 @@ sub spawn_ua {
 
         ServerInput =>
             sub {
-                my ( $heap, $r ) = @_[ HEAP, ARG0 ];
+                my ( $heap, $m ) = @_[ HEAP, ARG0 ];
 
+                unless ( defined $m ) {
+                    $_[KERNEL]->yield( "shutdown" );
+                    return;
+                }
+
+                $r = $m->{object};
                 # A hackish but fast way to remove comments.
                 $r->decode();
                 ${$r->content_ref} =~ s/^<!--.*?-->$//gsm;
 
                 $_[KERNEL]->post(
-                    $heap->{proxy_server} => send_response => $r
+                    $heap->{proxy_server} => send_response => $m
                 );
             },
 
@@ -240,8 +276,10 @@ sub spawn_ua {
 sub client_closed {
     my $heap = $_[HEAP];
 
-    $_[KERNEL]->post( $heap->{proxy_ua} => "shutdown" );
-    print "Client ", $heap->{connection}, " disconnected.\n";
+    if ( $heap->{proxy_ua} ) {
+        $_[KERNEL]->post( $heap->{proxy_ua} => "shutdown" );
+    }
+    print "[", $heap->{connection}, "] disconnected\n";
 }
 
 sub server_closed {
@@ -330,6 +368,309 @@ sub header_lines {
     });
 
     return @headers;
+}
+
+package HTTP::MessageParser;
+
+use HTTP::Request;
+use HTTP::Response;
+
+sub new {
+    my ($class, $type, $verbose) = @_;
+    bless {
+        state => 0,
+        type => $type,
+        object => undef,
+        verbose => $verbose || 0,
+        message => "",
+        buffer => "",
+        error => "",
+    }, $class;
+}
+
+sub reset {
+    my $self = shift;
+    $self->{state} = 0;
+    $self->{error} = "";
+    $self->{object} = undef;
+    $self->{message} = "";
+}
+
+sub debug {
+    my ($self, $string, $level) = @_;
+    $level ||= 1;
+    if ( $self->{verbose} >= $level ) {
+        print ">>> ", $string, "\n";
+    }
+}
+
+sub parse {
+    my ( $self, $text ) = @_;
+
+    my $state = $self->{state};
+    my $buf = \$self->{buffer};
+
+    $$buf .= $text;
+
+    if ( $state == 0 ) {
+        # We're waiting for a start line (and ignoring any empty lines
+        # before it) followed by message headers and a blank line.
+
+        while ( $$buf =~ /^($CRLF)/ ) {
+            substr( $$buf, 0, length($1), '' );
+        }
+
+        if ( $$buf =~ /$CRLF$CRLF/ ) {
+            $self->parse_head( substr( $$buf, 0, $+[0], '' ) );
+
+            return unless defined( my $r = $self->{object} );
+            if ( defined( my $te = $r->header( "Transfer-Encoding" ) ) ) {
+                $te =~ s/[ \t]*//g;
+                if ( $te ne "chunked" ) {
+                    $self->{error} = "Unknown transfer encoding: '$te'";
+                    return;
+                }
+                $state = 2;
+            }
+            elsif ( defined( my $cl = $r->header( "Content-Length" ) ) ) {
+                $state = 1;
+            }
+            else {
+                $state = 3;
+            }
+        }
+    }
+
+    if ( $state == 1 ) {
+        # We have the headers; now we're waiting for a non-chunked entity
+        # body. Do we have the whole thing yet?
+
+        my $cl = $self->{object}->content_length();
+        if ( length $$buf >= $cl ) {
+            my $body = substr( $$buf, 0, $cl, '' );
+            $self->{object}->content( $body );
+            $self->{message} .= $body;
+            $state = 3;
+        }
+    }
+
+    if ( $state == 2 ) {
+        # We have the headers; now we're reading the chunks of data that
+        # make up the entity body. While there's a chunk description...
+
+        while ( $$buf =~ /^([0-9A-Fa-f]+)[^\x0D\x0A]*($CRLF)/ ) {
+            my $desc = $+[0];
+            my $bytes = hex $1;
+            my $end = length $2;
+
+            # We're expecting a chunk of $bytes bytes
+            if ( $bytes ) {
+                my $cl = $desc + $bytes + $end;
+                if ( length $$buf >= $cl ) {
+                    $self->debug( "Got chunk of $bytes bytes" );
+                    my $chunk = substr( $$buf, 0, $cl, '' );
+                    if ( $chunk !~ /$CRLF$/s ) {
+                        $self->{error} = "Chunk data not terminated by CRLF";
+                        return;
+                    }
+                    my $data = substr( $chunk, $desc, -$end );
+                    $self->{object}->add_content( $data );
+                    $self->{message} .= $chunk;
+                }
+                else {
+                    last;
+                }
+            }
+            else {
+                if ( $$buf =~ /($CRLF$CRLF)/ ) {
+                    $self->debug( "Got last chunk" );
+                    my $chunk = substr( $$buf, 0, $+[0], '' );
+                    my $data = substr( $chunk, $desc, -length $2 );
+                    if ( $data ne '' ) {
+                        # XXX: We'll strip TE in requests, so we should
+                        # never receive a trailer that we can't discard.
+                        # (Note, however, that we do forward it anyway.)
+                        $self->debug( "Ignoring trailer in chunked message" );
+                    }
+                    $self->{message} .= $chunk;
+                    $state = 3;
+                    last;
+                }
+            }
+        }
+    }
+
+    if ( $state == 3 ) {
+        # We're all done.
+    }
+
+    $self->{state} = $state;
+}
+
+sub parse_head {
+    my ($self, $head) = @_;
+
+    my @lines = split /$CRLF/, $head;
+
+    my $start = $lines[0];
+    if ( ( $self->{type} == 0 &&
+           $start !~ /^$TOKEN[ \t]+[^ ]+[ \t]+$VERSION$/ ) or
+         ( $self->{type} == 1 &&
+           $start !~ /^$VERSION[ \t]+\d\d\d[ \t]+[^\x00-\x1F\x7F]*$/i ) )
+    {
+        $self->{error} = "Unparsable start line: '$start'";
+        return;
+    }
+
+    my $class = qw(HTTP::Request HTTP::Response)[ $self->{type} ];
+    $self->{object} = $class->parse( join "\x0A", @lines );
+    $self->{message} = $head;
+
+    $self->debug( Data::Dumper::Dumper( $self->{object} ), 2 );
+}
+
+sub has_message {
+    return shift->{state} >= 3;
+}
+
+package Filter::HTTP;
+
+our @ISA = qw(POE::Filter);
+use HTTP::Status qw(status_message);
+
+sub new {
+    my ($class, $type, $verbose) = @_;
+    die "Filter type must be 0 or 1" unless defined $type;
+
+    my $self = {
+        buffer => [],
+        parser => HTTP::MessageParser->new( $type, $verbose )
+    };
+    bless $self, $class;
+}
+
+sub _type { shift->{parser}->{type} }
+sub _verbose { shift->{parser}->{verbose} }
+
+sub clone {
+    my $old = shift;
+    my $new = {
+        buffer => [],
+        parser =>
+            HTTP::MessageParser->new( $old->_type(), $old->_verbose() )
+    };
+    return bless $new, ref $old;
+}
+
+sub get_one_start {
+    my ($self, $data) = @_;
+    push @{ $self->{buffer} }, $_ foreach @$data;
+}
+
+sub get_one {
+    my $self = shift;
+    my $events = [];
+    my $parser = $self->{parser};
+
+    return [] unless @{ $self->{buffer} };
+    my $string = shift @{ $self->{buffer} };
+
+    $parser->parse( $string );
+    if ( $parser->{error} ) {
+        push @$events, undef;
+        print "ERROR: ", $parser->{error}, "\n";
+    }
+    elsif ( $parser->has_message() ) {
+        push @$events, { text => $parser->{message},
+                         object => $parser->{object} };
+        $parser->reset();
+    }
+
+    return $events;
+}
+
+sub get_pending {
+    my $self = shift;
+    my $pending = [];
+
+    my $data = $self->{parser}->{buffer};
+    push @$pending, $$data if $$data;
+    push @$pending, @{ $self->{buffer} };
+    return unless @$pending;
+    return $pending;
+}
+
+sub put {
+  my $self = shift;
+  my $return;
+  if ( $self->_type() == 0 ) {
+     $return = $self->_put_response( @_ );
+  }
+  else {
+     $return = $self->_put_request( @_ );
+  }
+  $return;
+}
+
+sub _put_response {
+  my ($self, $responses) = @_;
+  my @raw;
+
+    foreach (@$responses) {
+        if ( ref $_ eq 'HTTP::Response' ) {
+            my $code           = $_->code;
+            my $status_message = status_message($code) || "Unknown Error";
+            my $message        = $_->message  || "";
+            my $proto          = $_->protocol || 'HTTP/1.0';
+
+            my $status_line = "$proto $code";
+            $status_line   .= " ($status_message)"  if $status_message ne $message;
+            $status_line   .= " $message" if length($message);
+
+            my @headers;
+            push @headers, $status_line;
+            push @headers, $_->headers_as_string("\x0D\x0A");
+
+            push @raw, join("\x0D\x0A", @headers, "") . $_->content;
+        }
+        else {
+            push @raw, $_;
+        }
+    }
+
+    \@raw;
+}
+
+sub _put_request {
+    my ($self, $requests) = @_;
+    my $total = 0;
+    my @raw;
+
+    foreach (@$requests) {
+        if ( ref $_ eq 'HTTP::Request' ) {
+            my $req_line = $_->method || "-";
+            my $uri = $_->uri;
+            $uri = (defined $uri) ? $uri->as_string : "-";
+            $req_line .= " $uri";
+            my $proto = $_->protocol;
+            $req_line .= " $proto" if $proto;
+
+            my @headers;
+            push @headers, $req_line;
+            push @headers, $_->headers_as_string("\x0D\x0A");
+
+            push @raw, join("\x0D\x0A", @headers, "") . $_->content;
+            $total += length $raw[$#raw];
+        }
+        else {
+            push @raw, $_;
+            $total += length $_;
+        }
+    }
+
+    print ">>> Sending $total bytes\n" if $self->_verbose();
+
+    \@raw;
 }
 
 =pod
