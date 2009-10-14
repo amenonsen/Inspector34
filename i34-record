@@ -172,6 +172,9 @@ POE::Component::Server::TCP->new(
                 Host => $transparent ?
                     "$fromhost:$fromport" : "$tohost:$toport"
             );
+            if ( $transparent ) {
+                $r->header( Via => $r->protocol() . " inspector34" );
+            }
 
             $heap->{requests}++;
             write_message( @$heap{qw/record connection requests/}, $r );
@@ -245,10 +248,14 @@ sub spawn_ua {
                     return;
                 }
 
-                $r = $m->{object};
-                # A hackish but fast way to remove comments.
-                $r->decode();
-                ${$r->content_ref} =~ s/^<!--.*?-->$//gsm;
+                $m->{object}->decode();
+                if ( $transparent &&
+                     $m->{object}->content_type() eq "text/html" )
+                {
+                    $m->{text} =~
+                        s{^<!-- (.*?) -->$}
+                         {(my $x = $1) =~ y/\x0A\x0D/x/c; "<!-- $x -->"}gsme;
+                }
 
                 $_[KERNEL]->post(
                     $heap->{proxy_server} => send_response => $m
